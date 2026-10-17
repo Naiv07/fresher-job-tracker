@@ -173,6 +173,11 @@ hr { border-color: #1a1a2e !important; margin: 1.5rem 0 !important; }
 [data-testid="stSidebarNavItems"] a[aria-current="page"] {
     background: #1a1a2e; border-left: 2px solid #6366f1;
 }
+
+/* ── Relevance reason text ─────────────────────────────────── */
+.relevance-reason {
+    font-size: 0.75rem; color: #818cf8; margin: 4px 0 8px;
+}
 </style>"""
 
 

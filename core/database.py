@@ -115,6 +115,41 @@ CREATE TABLE IF NOT EXISTS scrape_log (
 
 CREATE INDEX IF NOT EXISTS idx_scrape_log_portal ON scrape_log(portal);
 CREATE INDEX IF NOT EXISTS idx_scrape_log_status ON scrape_log(status);
+
+CREATE TABLE IF NOT EXISTS user_interactions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id      INTEGER REFERENCES jobs(id),
+    action      TEXT    NOT NULL,
+    created_at  TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_interactions_job    ON user_interactions(job_id);
+CREATE INDEX IF NOT EXISTS idx_interactions_action ON user_interactions(action);
+CREATE INDEX IF NOT EXISTS idx_interactions_time   ON user_interactions(created_at);
+
+CREATE TABLE IF NOT EXISTS search_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    keyword     TEXT,
+    roles       TEXT,
+    portals     TEXT,
+    min_score   REAL,
+    sort_by     TEXT,
+    created_at  TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_search_time ON search_history(created_at);
+
+CREATE TABLE IF NOT EXISTS user_preferences (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    category    TEXT    NOT NULL,
+    key         TEXT    NOT NULL,
+    weight      REAL    NOT NULL DEFAULT 1.0,
+    source      TEXT    NOT NULL DEFAULT 'learned',
+    updated_at  TEXT    NOT NULL,
+    UNIQUE(category, key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_prefs_category ON user_preferences(category);
 """
 
 
@@ -447,3 +482,120 @@ def get_last_successful_scrape() -> Optional[str]:
             "SELECT MAX(finished_at) FROM scrape_log WHERE status = 'success'"
         ).fetchone()
         return row[0] if row else None
+
+
+# ── User interactions ────────────────────────────────────────────────────────
+
+def log_interaction(job_id: int, action: str) -> None:
+    """Record a user interaction with a job."""
+    now = datetime.now(timezone.utc).isoformat()
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO user_interactions (job_id, action, created_at) VALUES (?, ?, ?)",
+            [job_id, action, now],
+        )
+
+
+def log_search(keyword: str, roles: list, portals: list,
+               min_score: float, sort_by: str) -> None:
+    """Record a search/filter session."""
+    now = datetime.now(timezone.utc).isoformat()
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO search_history (keyword, roles, portals, min_score, sort_by, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [keyword or "", json.dumps(roles or []), json.dumps(portals or []),
+             min_score, sort_by, now],
+        )
+
+
+def is_bookmarked(job_id: int) -> bool:
+    """Check if a job is currently bookmarked."""
+    with get_db() as conn:
+        row = conn.execute("""
+            SELECT
+                SUM(CASE WHEN action = 'bookmark' THEN 1 ELSE 0 END) -
+                SUM(CASE WHEN action = 'unbookmark' THEN 1 ELSE 0 END) AS net
+            FROM user_interactions WHERE job_id = ?
+        """, [job_id]).fetchone()
+        return (row[0] or 0) > 0
+
+
+def get_bookmarked_job_ids() -> list[int]:
+    """Return all currently bookmarked job IDs."""
+    with get_db() as conn:
+        rows = conn.execute("""
+            SELECT job_id,
+                SUM(CASE WHEN action = 'bookmark' THEN 1 ELSE 0 END) -
+                SUM(CASE WHEN action = 'unbookmark' THEN 1 ELSE 0 END) AS net
+            FROM user_interactions
+            WHERE action IN ('bookmark', 'unbookmark')
+            GROUP BY job_id
+            HAVING net > 0
+        """).fetchall()
+        return [r[0] for r in rows]
+
+
+# ── User preferences ────────────────────────────────────────────────────────
+
+def get_all_preferences() -> dict:
+    """Return all preferences grouped by category: {category: {key: weight}}."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT category, key, weight FROM user_preferences"
+        ).fetchall()
+    result: dict = {}
+    for row in rows:
+        result.setdefault(row["category"], {})[row["key"]] = row["weight"]
+    return result
+
+
+def upsert_preference(category: str, key: str, weight: float,
+                      source: str = "learned") -> None:
+    """Insert or update a single preference."""
+    now = datetime.now(timezone.utc).isoformat()
+    with get_db() as conn:
+        conn.execute(
+            """INSERT INTO user_preferences (category, key, weight, source, updated_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(category, key) DO UPDATE SET
+                   weight = excluded.weight,
+                   source = excluded.source,
+                   updated_at = excluded.updated_at""",
+            [category, key, weight, source, now],
+        )
+
+
+def delete_preferences_by_category(category: Optional[str] = None) -> None:
+    """Delete preferences. If category is None, delete all learned preferences."""
+    with get_db() as conn:
+        if category:
+            conn.execute(
+                "DELETE FROM user_preferences WHERE category = ? AND source = 'learned'",
+                [category],
+            )
+        else:
+            conn.execute("DELETE FROM user_preferences WHERE source = 'learned'")
+
+
+def get_interaction_stats() -> dict:
+    """Return counts of interactions, searches, and days of data."""
+    with get_db() as conn:
+        interactions = conn.execute(
+            "SELECT COUNT(*) FROM user_interactions"
+        ).fetchone()[0]
+        searches = conn.execute(
+            "SELECT COUNT(*) FROM search_history"
+        ).fetchone()[0]
+        first_row = conn.execute(
+            "SELECT MIN(created_at) FROM user_interactions"
+        ).fetchone()[0]
+    days = 0
+    if first_row:
+        from datetime import datetime as dt
+        try:
+            first = dt.fromisoformat(first_row.replace("Z", "+00:00"))
+            days = max(1, (datetime.now(timezone.utc) - first).days)
+        except Exception:
+            days = 0
+    return {"interactions": interactions, "searches": searches, "days": days}

@@ -2,7 +2,7 @@
 
 import streamlit as st
 
-from core.database import get_last_successful_scrape, init_db, count_jobs, get_active_resume, get_analysis_stats
+from core.database import get_last_successful_scrape, init_db, count_jobs, get_active_resume, get_analysis_stats, get_interaction_stats
 from core.scheduler import ensure_scheduler_running, is_data_stale, run_scrape_in_background
 from core.config import DEFAULT_SCRAPE_INTERVAL_HOURS
 from styles import inject_css
@@ -63,7 +63,7 @@ try:
     recent_jobs = count_jobs(days=7)
     resume = get_active_resume()
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Total Jobs", f"{total_jobs:,}")
     c2.metric("Last 7 Days", f"{recent_jobs:,}")
 
@@ -75,6 +75,9 @@ try:
     else:
         c3.metric("Analyzed", "—")
         c4.metric("Avg Match", "—")
+
+    i_stats = get_interaction_stats()
+    c5.metric("Learning Data", f"{i_stats['interactions']:,}")
 except Exception:
     pass
 
@@ -82,7 +85,7 @@ except Exception:
 st.markdown("")
 st.markdown("## Quick access")
 
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3 = st.columns(3)
 
 with c1:
     st.markdown(
@@ -107,6 +110,18 @@ with c2:
 with c3:
     st.markdown(
         '<div class="nav-card">'
+        '<h3>My Preferences</h3>'
+        '<p>See what the system has learned and fine-tune your job preferences.</p>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+    st.page_link("pages/5_My_Preferences.py", label="View Preferences")
+
+c4, c5, _ = st.columns(3)
+
+with c4:
+    st.markdown(
+        '<div class="nav-card">'
         '<h3>Notifications</h3>'
         '<p>Set up email alerts when new matching jobs are found.</p>'
         '</div>',
@@ -114,7 +129,7 @@ with c3:
     )
     st.page_link("pages/3_Notifications.py", label="Configure Alerts")
 
-with c4:
+with c5:
     st.markdown(
         '<div class="nav-card">'
         '<h3>Settings</h3>'
