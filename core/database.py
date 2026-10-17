@@ -110,11 +110,13 @@ CREATE TABLE IF NOT EXISTS scrape_log (
     jobs_found    INTEGER DEFAULT 0,
     jobs_new      INTEGER DEFAULT 0,
     error_message TEXT,
-    status        TEXT DEFAULT 'running'
+    status        TEXT DEFAULT 'running',
+    batch_id      TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_scrape_log_portal ON scrape_log(portal);
 CREATE INDEX IF NOT EXISTS idx_scrape_log_status ON scrape_log(status);
+CREATE INDEX IF NOT EXISTS idx_scrape_log_batch  ON scrape_log(batch_id);
 
 CREATE TABLE IF NOT EXISTS user_interactions (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -158,6 +160,15 @@ def init_db() -> None:
     import os
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     with get_db() as conn:
+        # Migrate existing DBs: add batch_id to scrape_log if table exists but column is missing
+        existing = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='scrape_log'"
+        ).fetchone()
+        if existing:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(scrape_log)").fetchall()]
+            if "batch_id" not in cols:
+                conn.execute("ALTER TABLE scrape_log ADD COLUMN batch_id TEXT")
+        # Now create all tables and indexes (safe for fresh + migrated DBs)
         conn.executescript(SCHEMA_SQL)
 
 
@@ -445,12 +456,12 @@ def save_notification_config(cfg: dict) -> None:
 
 # ── Scrape log ────────────────────────────────────────────────────────────────
 
-def log_scrape_start(portal: str) -> int:
+def log_scrape_start(portal: str, batch_id: Optional[str] = None) -> int:
     now = datetime.now(timezone.utc).isoformat()
     with get_db() as conn:
         cur = conn.execute(
-            "INSERT INTO scrape_log (portal, started_at, status) VALUES (?, ?, 'running')",
-            [portal, now],
+            "INSERT INTO scrape_log (portal, started_at, status, batch_id) VALUES (?, ?, 'running', ?)",
+            [portal, now, batch_id],
         )
         return cur.lastrowid
 
@@ -482,6 +493,74 @@ def get_last_successful_scrape() -> Optional[str]:
             "SELECT MAX(finished_at) FROM scrape_log WHERE status = 'success'"
         ).fetchone()
         return row[0] if row else None
+
+
+def insert_jobs_batch(jobs: list[dict]) -> int:
+    """Batch-insert jobs using executemany. Returns count of new (non-duplicate) rows."""
+    if not jobs:
+        return 0
+    sql = """
+        INSERT OR IGNORE INTO jobs
+            (job_id_hash, portal, title, company, company_desc,
+             location, experience_min, experience_max, salary_range,
+             full_jd, apply_url, posted_date, scraped_at)
+        VALUES
+            (:job_id_hash, :portal, :title, :company, :company_desc,
+             :location, :experience_min, :experience_max, :salary_range,
+             :full_jd, :apply_url, :posted_date, :scraped_at)
+    """
+    with get_db() as conn:
+        before = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+        conn.executemany(sql, jobs)
+        after = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+        return after - before
+
+
+def get_active_scrape_progress() -> Optional[dict]:
+    """Return progress of currently running scrape, or None if idle.
+
+    Returns: {running: int, portals_done: int, portals_total: int,
+              total_new: int, batch_id: str}
+    """
+    with get_db() as conn:
+        # Find the batch_id of any running scrape
+        running_row = conn.execute(
+            "SELECT batch_id FROM scrape_log WHERE status = 'running' AND batch_id IS NOT NULL "
+            "ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()
+        if not running_row:
+            return None
+
+        batch_id = running_row[0]
+
+        # Count portals in this batch
+        stats = conn.execute("""
+            SELECT
+                COUNT(*)                                              AS portals_total,
+                SUM(CASE WHEN status != 'running' THEN 1 ELSE 0 END) AS portals_done,
+                SUM(CASE WHEN status = 'running'  THEN 1 ELSE 0 END) AS running,
+                COALESCE(SUM(jobs_new), 0)                            AS total_new
+            FROM scrape_log WHERE batch_id = ?
+        """, [batch_id]).fetchone()
+
+        return {
+            "running": stats["running"],
+            "portals_done": stats["portals_done"],
+            "portals_total": stats["portals_total"],
+            "total_new": stats["total_new"],
+            "batch_id": batch_id,
+        }
+
+
+def get_current_scrape_details(batch_id: str) -> list[dict]:
+    """Return per-portal status for a given scrape batch."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT portal, status, jobs_found, jobs_new, error_message, started_at, finished_at "
+            "FROM scrape_log WHERE batch_id = ? ORDER BY started_at",
+            [batch_id],
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 # ── User interactions ────────────────────────────────────────────────────────

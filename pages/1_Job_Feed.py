@@ -7,9 +7,9 @@ import streamlit as st
 
 from core.config import PORTALS, ROLE_SEARCH_TERMS
 from core.database import (
-    count_jobs, get_active_resume, get_all_preferences,
-    get_bookmark_status_batch, get_bookmarked_job_ids, get_jobs,
-    get_last_successful_scrape, log_interaction, log_search,
+    count_jobs, get_active_resume, get_active_scrape_progress,
+    get_all_preferences, get_bookmark_status_batch, get_bookmarked_job_ids,
+    get_jobs, get_last_successful_scrape, log_interaction, log_search,
 )
 from core.preferences import compute_relevance_scores, recompute_preferences
 from core.scheduler import is_data_stale, run_scrape_in_background
@@ -97,6 +97,29 @@ with col_btn:
 
 if is_data_stale() and last_scraped:
     st.warning("Data may be stale. Click **Scrape now** to refresh.")
+
+# ── Live scrape progress ───────────────────────────────────────────────────
+@st.fragment(run_every=5)
+def _live_scrape_status():
+    progress = get_active_scrape_progress()
+    if not progress:
+        if st.session_state.get("_scrape_was_running"):
+            st.session_state.pop("_scrape_was_running", None)
+            st.session_state.pop("_last_shown_new", None)
+            st.rerun(scope="app")  # final refresh when scrape ends
+        return
+
+    st.session_state["_scrape_was_running"] = True
+    pct = progress["portals_done"] / max(progress["portals_total"], 1)
+    st.progress(pct, text=f"Scraping... {progress['portals_done']}/{progress['portals_total']} portals · {progress['total_new']} new jobs")
+
+    # Auto-refresh when 3+ new jobs arrive since last refresh
+    new_since = progress["total_new"] - st.session_state.get("_last_shown_new", 0)
+    if new_since >= 3:
+        st.session_state["_last_shown_new"] = progress["total_new"]
+        st.rerun(scope="app")
+
+_live_scrape_status()
 
 # ── Log search (deduplicated) ───────────────────────────────────────────────
 search_sig = f"{keyword}|{selected_roles}|{selected_portals}|{min_score_filter}|{sort_by}"

@@ -1,14 +1,19 @@
-"""Scraping orchestrator — runs all enabled scrapers, deduplicates, and persists jobs.
+"""Scraping orchestrator — runs scrapers in parallel with batch inserts.
 
-Runs scrapers sequentially (not parallel) to avoid triggering rate limits
-simultaneously across portals. Writes to scrape_log for each portal.
+Uses ThreadPoolExecutor to run up to MAX_CONCURRENT_PORTALS portals
+simultaneously. Each portal scrapes all roles sequentially, with an
+early-stop if 2 consecutive roles yield 0 new jobs.
 """
 
 import traceback
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional
 
 from core import config as cfg
-from core.database import insert_job, log_scrape_end, log_scrape_start
+from core.database import (
+    insert_job, insert_jobs_batch, log_scrape_end, log_scrape_start,
+)
 from scrapers.naukri import NaukriScraper
 from scrapers.internshala import InternshalaScraper
 from scrapers.timesjobs import TimesJobsScraper
@@ -33,13 +38,75 @@ SCRAPER_REGISTRY = {
 }
 
 
+def _scrape_single_portal(
+    portal_name: str,
+    role_terms: list[str],
+    location: str,
+    batch_id: str,
+) -> dict:
+    """Scrape one portal for all roles. Runs in a worker thread.
+
+    Returns: {portal, found, new, status, error}
+    """
+    log_id = log_scrape_start(portal_name, batch_id=batch_id)
+    portal_found = 0
+    portal_new = 0
+    error_msg = None
+    consecutive_empty = 0
+
+    try:
+        scraper_cls = SCRAPER_REGISTRY[portal_name]
+        scraper = scraper_cls()
+
+        for role in role_terms:
+            # Early-stop: skip remaining roles if 2 in a row yielded 0 new jobs
+            if consecutive_empty >= 2:
+                break
+
+            try:
+                jobs = scraper.fetch_jobs(role=role, location=location)
+                portal_found += len(jobs)
+
+                # Batch insert all jobs from this role
+                new_count = insert_jobs_batch(jobs) if jobs else 0
+                portal_new += new_count
+
+                if new_count == 0:
+                    consecutive_empty += 1
+                else:
+                    consecutive_empty = 0
+
+            except Exception as e:
+                error_msg = f"{role}: {str(e)}"
+
+    except Exception as e:
+        error_msg = traceback.format_exc()
+
+    # Detect selector drift
+    if portal_found == 0 and error_msg is None:
+        status = "SELECTOR_DRIFT"
+        error_msg = "Portal returned 0 jobs with HTTP 200 — possible selector change"
+    else:
+        status = "success" if error_msg is None else "partial" if portal_new > 0 else "error"
+
+    log_scrape_end(log_id, portal_found, portal_new, status=status, error=error_msg)
+
+    return {
+        "portal": portal_name,
+        "found": portal_found,
+        "new": portal_new,
+        "status": status,
+        "error": error_msg,
+    }
+
+
 def run_all_scrapers(
     portals: Optional[list[str]] = None,
     roles: Optional[list[str]] = None,
     location: str = cfg.PRIMARY_LOCATION,
     progress_callback: Optional[Callable[[str, int, int], None]] = None,
 ) -> dict:
-    """Run all (or selected) scrapers for all target roles.
+    """Run all (or selected) scrapers in parallel batches.
 
     Args:
         portals: list of portal names to scrape (default: all in config)
@@ -59,6 +126,9 @@ def run_all_scrapers(
             role_terms.extend(term_list)
         role_terms = list(dict.fromkeys(role_terms))  # deduplicate, preserve order
 
+    # Filter to valid portals
+    valid_portals = [p for p in portals if p in SCRAPER_REGISTRY]
+
     summary = {
         "total_found": 0,
         "total_new": 0,
@@ -66,59 +136,48 @@ def run_all_scrapers(
         "errors": [],
     }
 
-    total_steps = len(portals)
-    step = 0
+    batch_id = uuid.uuid4().hex[:8]
+    total_steps = len(valid_portals)
+    completed = 0
 
-    for portal_name in portals:
-        step += 1
-        if portal_name not in SCRAPER_REGISTRY:
-            continue
-
-        if progress_callback:
-            progress_callback(f"Scraping {portal_name}...", step, total_steps)
-
-        log_id = log_scrape_start(portal_name)
-        portal_found = 0
-        portal_new = 0
-        error_msg = None
-
-        try:
-            scraper_cls = SCRAPER_REGISTRY[portal_name]
-            scraper = scraper_cls()
-
-            for role in role_terms:
-                try:
-                    jobs = scraper.fetch_jobs(role=role, location=location)
-                    portal_found += len(jobs)
-
-                    for job in jobs:
-                        inserted = insert_job(job)
-                        if inserted:
-                            portal_new += 1
-
-                except Exception as e:
-                    # Role-level failure — log but continue with next role
-                    error_msg = f"{role}: {str(e)}"
-
-        except Exception as e:
-            error_msg = traceback.format_exc()
-            summary["errors"].append(f"{portal_name}: {str(e)}")
-
-        # Detect selector drift: 0 jobs found with no errors suggests HTML changed
-        if portal_found == 0 and error_msg is None:
-            status = "SELECTOR_DRIFT"
-            error_msg = "Portal returned 0 jobs with HTTP 200 — possible selector change"
-        else:
-            status = "success" if error_msg is None else "partial" if portal_new > 0 else "error"
-
-        log_scrape_end(log_id, portal_found, portal_new, status=status, error=error_msg)
-
-        summary["total_found"] += portal_found
-        summary["total_new"] += portal_new
-        summary["portals"][portal_name] = {
-            "found": portal_found,
-            "new": portal_new,
-            "status": status,
+    with ThreadPoolExecutor(max_workers=cfg.MAX_CONCURRENT_PORTALS) as executor:
+        futures = {
+            executor.submit(
+                _scrape_single_portal, portal_name, role_terms, location, batch_id
+            ): portal_name
+            for portal_name in valid_portals
         }
+
+        for future in as_completed(futures):
+            completed += 1
+            portal_name = futures[future]
+
+            try:
+                result = future.result()
+            except Exception as e:
+                result = {
+                    "portal": portal_name,
+                    "found": 0,
+                    "new": 0,
+                    "status": "error",
+                    "error": str(e),
+                }
+
+            summary["total_found"] += result["found"]
+            summary["total_new"] += result["new"]
+            summary["portals"][result["portal"]] = {
+                "found": result["found"],
+                "new": result["new"],
+                "status": result["status"],
+            }
+            if result.get("error"):
+                summary["errors"].append(f"{result['portal']}: {result['error']}")
+
+            if progress_callback:
+                progress_callback(
+                    f"Done: {result['portal']} ({result['new']} new)",
+                    completed,
+                    total_steps,
+                )
 
     return summary

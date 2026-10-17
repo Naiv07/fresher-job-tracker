@@ -60,6 +60,7 @@ REQUEST_DELAY_MIN = 2.0   # seconds between requests (min)
 REQUEST_DELAY_MAX = 4.5   # seconds between requests (max)
 MAX_RETRIES = 3
 MAX_PAGES_PER_PORTAL = 3  # pages to scrape per role per portal
+MAX_CONCURRENT_PORTALS = 3  # parallel scraper threads
 
 # ── Scheduler ────────────────────────────────────────────────────────────────
 DEFAULT_SCRAPE_INTERVAL_HOURS = 6
