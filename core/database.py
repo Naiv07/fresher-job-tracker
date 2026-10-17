@@ -566,6 +566,39 @@ def upsert_preference(category: str, key: str, weight: float,
         )
 
 
+def upsert_preferences_batch(entries: list[tuple]) -> None:
+    """Batch upsert preferences. Each entry: (category, key, weight, source)."""
+    now = datetime.now(timezone.utc).isoformat()
+    with get_db() as conn:
+        conn.executemany(
+            """INSERT INTO user_preferences (category, key, weight, source, updated_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(category, key) DO UPDATE SET
+                   weight = excluded.weight,
+                   source = excluded.source,
+                   updated_at = excluded.updated_at""",
+            [(c, k, w, s, now) for c, k, w, s in entries],
+        )
+
+
+def get_bookmark_status_batch(job_ids: list[int]) -> set[int]:
+    """Return set of job IDs that are currently bookmarked."""
+    if not job_ids:
+        return set()
+    with get_db() as conn:
+        placeholders = ",".join("?" * len(job_ids))
+        rows = conn.execute(f"""
+            SELECT job_id,
+                SUM(CASE WHEN action = 'bookmark' THEN 1 ELSE 0 END) -
+                SUM(CASE WHEN action = 'unbookmark' THEN 1 ELSE 0 END) AS net
+            FROM user_interactions
+            WHERE job_id IN ({placeholders}) AND action IN ('bookmark', 'unbookmark')
+            GROUP BY job_id
+            HAVING net > 0
+        """, job_ids).fetchall()
+        return {r[0] for r in rows}
+
+
 def delete_preferences_by_category(category: Optional[str] = None) -> None:
     """Delete preferences. If category is None, delete all learned preferences."""
     with get_db() as conn:
@@ -592,9 +625,8 @@ def get_interaction_stats() -> dict:
         ).fetchone()[0]
     days = 0
     if first_row:
-        from datetime import datetime as dt
         try:
-            first = dt.fromisoformat(first_row.replace("Z", "+00:00"))
+            first = datetime.fromisoformat(first_row.replace("Z", "+00:00"))
             days = max(1, (datetime.now(timezone.utc) - first).days)
         except Exception:
             days = 0

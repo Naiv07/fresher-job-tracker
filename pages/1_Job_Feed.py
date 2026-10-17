@@ -1,16 +1,17 @@
 """Job Feed — browse, filter, and apply to fresher jobs."""
 
 import html
+import time
 
 import streamlit as st
 
 from core.config import PORTALS, ROLE_SEARCH_TERMS
 from core.database import (
-    count_jobs, get_active_resume, get_bookmarked_job_ids, get_jobs,
-    get_last_successful_scrape, is_bookmarked, log_interaction, log_search,
+    count_jobs, get_active_resume, get_all_preferences,
+    get_bookmark_status_batch, get_bookmarked_job_ids, get_jobs,
+    get_last_successful_scrape, log_interaction, log_search,
 )
 from core.preferences import compute_relevance_scores, recompute_preferences
-from core.database import get_all_preferences
 from core.scheduler import is_data_stale, run_scrape_in_background
 from styles import inject_css, score_pill, parse_json_list
 
@@ -19,6 +20,10 @@ inject_css()
 
 st.title("Job Feed")
 st.caption("Browse and filter fresher jobs from all portals")
+
+# ── Fetch resume once ────────────────────────────────────────────────────────
+resume = get_active_resume()
+resume_id = resume["id"] if resume else None
 
 # ── Sidebar filters ──────────────────────────────────────────────────────────
 with st.sidebar:
@@ -55,9 +60,8 @@ with st.sidebar:
     )
     sort_map = {"Newest": "newest", "Best match": "score", "Company A-Z": "company", "Recommended": "newest"}
 
-    has_resume = get_active_resume() is not None
     min_score_filter = 0.0
-    if has_resume:
+    if resume:
         min_score_filter = st.slider("Min match %", 0, 100, 0, 5, format="%d%%")
     else:
         st.caption("Upload a resume to filter by match score.")
@@ -65,9 +69,6 @@ with st.sidebar:
     show_bookmarked = st.checkbox("Show saved only")
 
 # ── Build query params ───────────────────────────────────────────────────────
-resume = get_active_resume()
-resume_id = resume["id"] if resume else None
-
 role_terms: list[str] = []
 for role in selected_roles:
     role_terms.extend(ROLE_SEARCH_TERMS.get(role, [role]))
@@ -105,7 +106,6 @@ if st.session_state.get("last_search_sig") != search_sig:
 
 # ── Throttled preference recomputation ──────────────────────────────────────
 if resume_id:
-    import time
     last_recomp = st.session_state.get("prefs_last_recomputed", 0)
     if time.time() - last_recomp > 600:  # every 10 min
         recompute_preferences(resume_id)
@@ -119,9 +119,9 @@ if "job_page" not in st.session_state:
 total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
 
 # ── Fetch jobs ───────────────────────────────────────────────────────────────
-# For Recommended sort, fetch more jobs so re-ranking has a meaningful pool
-fetch_limit = 100 if sort_by == "Recommended" else PAGE_SIZE
-fetch_offset = 0 if sort_by == "Recommended" else st.session_state.job_page * PAGE_SIZE
+use_recommended = sort_by == "Recommended"
+fetch_limit = 100 if use_recommended else PAGE_SIZE
+fetch_offset = 0 if use_recommended else st.session_state.job_page * PAGE_SIZE
 
 jobs = get_jobs(
     portals=selected_portals or None,
@@ -140,27 +140,23 @@ if show_bookmarked:
     bookmarked_ids = set(get_bookmarked_job_ids())
     jobs = [j for j in jobs if j["id"] in bookmarked_ids]
 
-# ── Apply relevance scoring ─────────────────────────────────────────────────
+# ── Apply relevance scoring + paginate for Recommended ──────────────────────
 preferences = get_all_preferences()
-if sort_by == "Recommended" and preferences:
+if use_recommended:
     jobs = compute_relevance_scores(jobs, preferences)
-    # Paginate after re-ranking
     start = st.session_state.job_page * PAGE_SIZE
     jobs = jobs[start : start + PAGE_SIZE]
     total_pages = max(1, (min(total, 100) + PAGE_SIZE - 1) // PAGE_SIZE)
-elif sort_by == "Recommended":
-    # No preferences yet — still compute for display but don't re-rank
-    if jobs:
-        compute_relevance_scores(jobs, preferences)
-        start = st.session_state.job_page * PAGE_SIZE
-        jobs = jobs[start : start + PAGE_SIZE]
-        total_pages = max(1, (min(total, 100) + PAGE_SIZE - 1) // PAGE_SIZE)
+
+# ── Batch-load bookmark status for visible jobs ─────────────────────────────
+visible_ids = [j["id"] for j in jobs]
+bookmarked_set = get_bookmark_status_batch(visible_ids)
 
 if not jobs:
     st.markdown("")
     st.info("No jobs found. Adjust filters or click **Scrape now** to fetch fresh jobs.")
 else:
-    if sort_by == "Recommended" and preferences:
+    if use_recommended and preferences:
         st.caption("Personalized for you — based on your resume, searches, and feedback")
     st.markdown("")
 
@@ -168,12 +164,6 @@ else:
         score = job.get("match_score")
         portal_label = (job.get("portal") or "").title()
         posted = (job.get("posted_date") or job.get("scraped_at", ""))[:10]
-
-        # Card header
-        pill = score_pill(score)
-        header = f"**{job['title']}**  —  {job['company']}"
-        if pill:
-            header += f"  {pill}"
 
         with st.expander(f"[{portal_label}]  {job['title']}  —  {job['company']}  ·  {posted}", expanded=False):
             col_main, col_side = st.columns([3, 1])
@@ -185,7 +175,7 @@ else:
 
                 # Relevance reasons
                 reasons = job.get("relevance_reasons", [])
-                if reasons and sort_by == "Recommended":
+                if reasons and use_recommended:
                     st.markdown(
                         f"<div style='font-size:0.75rem;color:#818cf8;margin:4px 0 8px'>"
                         f"{'  ·  '.join(reasons)}</div>",
@@ -202,7 +192,7 @@ else:
                 exp_max = job.get("experience_max", 2) or 2
                 meta.append(f"{exp_min}-{exp_max} yrs")
                 meta.append(portal_label)
-                if job.get("relevance_score") and sort_by == "Recommended":
+                if job.get("relevance_score") and use_recommended:
                     meta.append(f"Relevance: {job['relevance_score']:.0f}")
                 st.caption("  ·  ".join(meta))
 
@@ -240,29 +230,23 @@ else:
 
                 # Bookmark + feedback row
                 @st.fragment
-                def _actions(j=job):
+                def _actions(j=job, bm_set=bookmarked_set, r_id=resume_id):
                     col_bm, col_up, col_dn = st.columns(3)
                     with col_bm:
-                        bm = is_bookmarked(j["id"])
-                        if st.button("Saved" if bm else "Save", key=f"bm_{j['id']}",
+                        is_bm = j["id"] in bm_set
+                        if st.button("Saved" if is_bm else "Save", key=f"bm_{j['id']}",
                                      use_container_width=True):
-                            log_interaction(j["id"], "unbookmark" if bm else "bookmark")
+                            log_interaction(j["id"], "unbookmark" if is_bm else "bookmark")
                             st.rerun(scope="app")
                     with col_up:
                         if st.button("+", key=f"up_{j['id']}", help="Good match",
                                      use_container_width=True):
                             log_interaction(j["id"], "thumbs_up")
-                            if resume_id:
-                                recompute_preferences(resume_id)
-                                st.session_state["prefs_last_recomputed"] = __import__("time").time()
                             st.toast("Noted — more like this")
                     with col_dn:
                         if st.button("-", key=f"dn_{j['id']}", help="Not for me",
                                      use_container_width=True):
                             log_interaction(j["id"], "thumbs_down")
-                            if resume_id:
-                                recompute_preferences(resume_id)
-                                st.session_state["prefs_last_recomputed"] = __import__("time").time()
                             st.toast("Noted — fewer like this")
                 _actions()
 

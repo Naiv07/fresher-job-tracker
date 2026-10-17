@@ -15,7 +15,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 
 from core.config import ROLE_SEARCH_TERMS
-from core.database import get_db, upsert_preference
+from core.database import get_db, upsert_preferences_batch
 
 # ── Signal weights ───────────────────────────────────────────────────────────
 
@@ -242,16 +242,18 @@ def recompute_preferences(resume_id: int) -> int:
         for key, weight in kv.items():
             merged[category][key] += weight
 
-    # Normalize and save
-    count = 0
+    # Normalize and batch-save
+    entries = []
     for category, kv in merged.items():
         normalized = _normalize_signals(kv)
         for key, weight in normalized.items():
             if weight > 0.1:  # skip near-zero preferences
-                upsert_preference(category, key, weight, source="learned")
-                count += 1
+                entries.append((category, key, weight, "learned"))
 
-    return count
+    if entries:
+        upsert_preferences_batch(entries)
+
+    return len(entries)
 
 
 # ── Relevance scoring ────────────────────────────────────────────────────────
